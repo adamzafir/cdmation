@@ -17,7 +17,7 @@ When you `cd` into a tracked repo (or any of its subdirectories), the automation
 ```bash
 brew tap adamzafir/cdmation
 brew install cdmation
-echo 'source "$(brew --prefix)/opt/cdmation/share/cdmation/cdmation-hook.zsh"' >> ~/.zshrc
+printf '\nsource "%s"\n' "$(brew --prefix)/opt/cdmation/share/cdmation/cdmation-hook.zsh" >> ~/.zshrc
 source ~/.zshrc
 ```
 
