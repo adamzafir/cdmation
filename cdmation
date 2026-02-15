@@ -1,0 +1,349 @@
+#!/usr/bin/env zsh
+
+set -u
+set +x
+
+CDMATION_HOME="${CDMATION_HOME:-$HOME/.cdmation}"
+AUTOMATIONS_FILE="$CDMATION_HOME/automations.tsv"
+SCRIPTS_DIR="$CDMATION_HOME/scripts"
+
+ensure_store() {
+  mkdir -p "$SCRIPTS_DIR"
+  [[ -f "$AUTOMATIONS_FILE" ]] || : > "$AUTOMATIONS_FILE"
+}
+
+print_help() {
+  cat <<HELP
+cdmation - automations for your cds
+
+Usage:
+  cdmation add <name> <path>   Add automation for a directory and open editor
+  cdmation add <path>          Add automation for a directory (name = basename)
+  cdmation add .               Add automation for current directory
+  cdmation list                List automations
+  cdmation rename <old> <new>  Rename automation
+  cdmation remove <name>       Remove automation
+  cdmation help                Show help
+HELP
+}
+
+err() {
+  print -u2 -- "cdmation: $*"
+}
+
+validate_name() {
+  local name="$1"
+  [[ "$name" =~ '^[A-Za-z0-9._-]+$' ]]
+}
+
+resolve_dir() {
+  local input="$1"
+  if [[ ! -d "$input" ]]; then
+    return 1
+  fi
+  (
+    cd "$input" >/dev/null 2>&1 || return 1
+    pwd -P
+  )
+}
+
+name_exists() {
+  local needle="$1"
+  awk -F $'\t' -v needle="${needle:l}" 'BEGIN{found=0} tolower($1)==needle {found=1} END{exit found?0:1}' "$AUTOMATIONS_FILE"
+}
+
+path_exists() {
+  local needle="$1"
+  awk -F $'\t' -v needle="$needle" 'BEGIN{found=0} $2==needle {found=1} END{exit found?0:1}' "$AUTOMATIONS_FILE"
+}
+
+get_record_by_name() {
+  local needle="$1"
+  awk -F $'\t' -v needle="${needle:l}" 'tolower($1)==needle {print $0; exit}' "$AUTOMATIONS_FILE"
+}
+
+tui_editor() {
+  local file="$1"
+  local -a lines=()
+  local input
+  local title reset dim accent
+
+  if [[ -t 1 ]]; then
+    title=$'\033[1;36m'
+    accent=$'\033[1;32m'
+    dim=$'\033[2m'
+    reset=$'\033[0m'
+  else
+    title=""
+    accent=""
+    dim=""
+    reset=""
+  fi
+
+  while true; do
+    if [[ -t 1 ]]; then
+      printf '\033[2J\033[H'
+    fi
+
+    print -- "${title}cdmation editor${reset}"
+    print -- "${dim}Add one command per line. It runs when you enter this repo.${reset}"
+    print -- ""
+    print -- "${accent}/done${reset} save  ${accent}/undo${reset} remove last line  ${accent}/clear${reset} clear all  ${accent}/abort${reset} cancel"
+    print -- "------------------------------------------------------------"
+
+    if (( ${#lines[@]} == 0 )); then
+      print -- "${dim}(no commands yet)${reset}"
+    else
+      local idx=1
+      local line=""
+      for line in "${lines[@]}"; do
+        printf "%3d | %s\n" "$idx" "$line"
+        (( idx++ ))
+      done
+    fi
+
+    print -- "------------------------------------------------------------"
+    printf "> "
+    IFS= read -r input || return 1
+
+    case "$input" in
+      /done)
+        local has_command=0
+        local line=""
+        for line in "${lines[@]}"; do
+          if [[ -n "${line//[[:space:]]/}" ]]; then
+            has_command=1
+            break
+          fi
+        done
+
+        if (( has_command == 0 )); then
+          err "Automation is empty."
+          sleep 1
+          continue
+        fi
+        {
+          print -- "#!/usr/bin/env zsh"
+          print -- ""
+          for line in "${lines[@]}"; do
+            print -- "$line"
+          done
+        } > "$file"
+        return 0
+        ;;
+      /undo)
+        (( ${#lines[@]} > 0 )) && unset 'lines[-1]'
+        ;;
+      /clear)
+        lines=()
+        ;;
+      /abort)
+        return 1
+        ;;
+      *)
+        lines+=("$input")
+        ;;
+    esac
+  done
+}
+
+open_editor() {
+  local file="$1"
+  tui_editor "$file"
+}
+
+sanitize_name() {
+  local raw="$1"
+  local out
+  out="${raw// /-}"
+  out="${out//[^A-Za-z0-9._-]/-}"
+  out="${out##-}"
+  out="${out%%-}"
+  [[ -n "$out" ]] || out="automation"
+  print -- "$out"
+}
+
+cmd_add() {
+  ensure_store
+
+  local name raw_path abs_path base script_file tmp_file
+
+  if (( $# == 2 )); then
+    name="$1"
+    raw_path="$2"
+  elif (( $# == 1 )); then
+    raw_path="$1"
+    abs_path="$(resolve_dir "$raw_path")" || {
+      err "Path does not exist: $raw_path"
+      return 1
+    }
+    base="${abs_path:t}"
+    name="$(sanitize_name "$base")"
+  else
+    err "Usage: cdmation add <name> <path>"
+    err "   or: cdmation add <path>"
+    return 1
+  fi
+
+  validate_name "$name" || {
+    err "Invalid name '$name'. Use letters, numbers, dot, underscore, dash."
+    return 1
+  }
+
+  abs_path="$(resolve_dir "$raw_path")" || {
+    err "Path does not exist: $raw_path"
+    return 1
+  }
+
+  name_exists "$name" && {
+    err "Automation '$name' already exists."
+    return 1
+  }
+
+  path_exists "$abs_path" && {
+    err "An automation already exists for path: $abs_path"
+    return 1
+  }
+
+  script_file="$SCRIPTS_DIR/${name}.zsh"
+  tmp_file="$script_file.tmp.$$"
+
+  : > "$tmp_file"
+
+  open_editor "$tmp_file" || {
+    rm -f "$tmp_file"
+    err "Editor canceled."
+    return 1
+  }
+
+  mv "$tmp_file" "$script_file"
+  chmod +x "$script_file"
+
+  print -- "$name\t$abs_path\t$script_file" >> "$AUTOMATIONS_FILE"
+
+  print -- "Added automation '$name' for $abs_path"
+}
+
+cmd_list() {
+  ensure_store
+  if [[ ! -s "$AUTOMATIONS_FILE" ]]; then
+    print -- "No automations yet."
+    return 0
+  fi
+
+  printf "%-24s %-50s %s\n" "NAME" "PATH" "SCRIPT"
+  printf "%-24s %-50s %s\n" "----" "----" "------"
+  awk -F $'\t' '{printf "%-24s %-50s %s\n", $1, $2, $3}' "$AUTOMATIONS_FILE"
+}
+
+cmd_rename() {
+  ensure_store
+
+  if (( $# != 2 )); then
+    err "Usage: cdmation rename <oldname> <newname>"
+    return 1
+  fi
+
+  local old="$1"
+  local new="$2"
+  local record old_actual target_dir script new_script tmp_file
+  local new_key="${new:l}"
+
+  validate_name "$new" || {
+    err "Invalid new name '$new'."
+    return 1
+  }
+
+  record="$(get_record_by_name "$old")"
+  [[ -n "$record" ]] || {
+    err "Automation '$old' not found."
+    return 1
+  }
+
+  local _
+  IFS=$'\t' read -r old_actual target_dir script <<< "$record"
+
+  if [[ "$new_key" != "${old_actual:l}" ]] && name_exists "$new"; then
+    err "Automation '$new' already exists."
+    return 1
+  fi
+
+  new_script="$SCRIPTS_DIR/${new}.zsh"
+  if [[ "$script" != "$new_script" ]] && [[ -f "$script" ]]; then
+    if [[ "${script:l}" == "${new_script:l}" ]]; then
+      local case_tmp="${new_script}.case.$$"
+      mv "$script" "$case_tmp" && mv "$case_tmp" "$new_script"
+    else
+      mv "$script" "$new_script"
+    fi
+  fi
+
+  tmp_file="$AUTOMATIONS_FILE.tmp.$$"
+  awk -F $'\t' -v old_key="${old_actual:l}" -v new="$new" -v new_script="$new_script" 'BEGIN{OFS="\t"}
+    tolower($1)==old_key {$1=new; $3=new_script}
+    {print $0}
+  ' "$AUTOMATIONS_FILE" > "$tmp_file"
+  mv "$tmp_file" "$AUTOMATIONS_FILE"
+
+  print -- "Renamed '$old' -> '$new'"
+}
+
+cmd_remove() {
+  ensure_store
+
+  if (( $# != 1 )); then
+    err "Usage: cdmation remove <name>"
+    return 1
+  fi
+
+  local name="$1"
+  local record script tmp_file
+
+  record="$(get_record_by_name "$name")"
+  [[ -n "$record" ]] || {
+    err "Automation '$name' not found."
+    return 1
+  }
+
+  local _ target_dir
+  IFS=$'\t' read -r _ target_dir script <<< "$record"
+
+  tmp_file="$AUTOMATIONS_FILE.tmp.$$"
+  awk -F $'\t' -v name_key="${name:l}" 'tolower($1)!=name_key {print $0}' "$AUTOMATIONS_FILE" > "$tmp_file"
+  mv "$tmp_file" "$AUTOMATIONS_FILE"
+
+  [[ -f "$script" ]] && rm -f "$script"
+
+  print -- "Removed automation '$name'"
+}
+
+main() {
+  local cmd="${1:-help}"
+  cmd="${cmd%:}"
+  shift || true
+
+  case "$cmd" in
+    add)
+      cmd_add "$@"
+      ;;
+    list)
+      cmd_list "$@"
+      ;;
+    rename)
+      cmd_rename "$@"
+      ;;
+    remove)
+      cmd_remove "$@"
+      ;;
+    help|-h|--help)
+      print_help
+      ;;
+    *)
+      err "Unknown command: $cmd"
+      print_help
+      return 1
+      ;;
+  esac
+}
+
+main "$@"
